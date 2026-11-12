@@ -20,3 +20,4 @@ class AdmmBackend(enum.IntEnum):
     JAX_LOOP = 0
     FUSED_PCG = 1
     FUSED_CUDSS = 2
+    FUSED_RICCATI_CPU = 3

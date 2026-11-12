@@ -36,6 +36,16 @@ class ADMMParams(NamedTuple):
     eps_prim_inf: float = 1.0e-4
     eps_dual_inf: float = 1.0e-4
     check_infeasibility_every: int = 25
+    # Exactly max_iter iterations: no termination, infeasibility or rho checks inside
+    # the loop; residuals and the status are evaluated once, after the last iteration.
+    fixed_iterations: bool = False
+
+
+def _checks_termination(params: ADMMParams, it: jnp.ndarray) -> jnp.ndarray:
+    """Whether residuals are evaluated (and the loop may stop) after iteration ``it``."""
+    if params.fixed_iterations:
+        return (it + 1) == params.max_iter
+    return ((it % params.check_termination_every) == 0) | ((it + 1) == params.max_iter)
 
 
 class ADMMState(NamedTuple):
@@ -754,7 +764,7 @@ def _update_residuals_and_rho(
     def _maybe_update_rho_and_schur(
         should_check: jnp.ndarray, residuals: ADMMResiduals
     ) -> Tuple[jnp.ndarray, SchurComplementMatrices, jnp.ndarray]:
-        if params.adapt_rho_every <= 0:
+        if params.adapt_rho_every <= 0 or params.fixed_iterations:
             return state.rho_bar, schur, jnp.asarray(False)
 
         def _update_rho_and_schur(_):
@@ -797,9 +807,7 @@ def _update_residuals_and_rho(
             operand=None,
         )
 
-    should_check_termination = ((it % params.check_termination_every) == 0) | (
-        (it + 1) == params.max_iter
-    )
+    should_check_termination = _checks_termination(params, it)
     rhos_local = rhos_local.at[it].set(state.rho_bar)
     residuals = _maybe_compute_residuals(should_check_termination)
     (
@@ -880,6 +888,8 @@ class ADMMSolver:
         eps_dual_inf: float = 1.0e-4,
         constraint_handling: ConstraintHandling = ConstraintHandling.PROJECTION,
         log_barrier_kappa: float = 0.0,
+        fixed_iterations: bool = False,
+        num_threads: int = 1,
     ):
         if admm_backend == AdmmBackend.JAX_LOOP and schur_solver is None:
             raise ValueError("admm_backend=JAX_LOOP requires schur_solver")
@@ -925,6 +935,30 @@ class ADMMSolver:
             raise ValueError("log_barrier_kappa must be zero for projection handling")
         self._zshape = zshape
         self._cudss_workspace = None
+        self._fixed_iterations = bool(fixed_iterations)
+        self._num_threads = int(num_threads)
+        if self._num_threads < 1:
+            raise ValueError("num_threads must be at least 1")
+        if self._fixed_iterations and admm_backend in (
+            AdmmBackend.FUSED_PCG,
+            AdmmBackend.FUSED_CUDSS,
+        ):
+            raise ValueError(
+                "fixed_iterations is supported by the JAX loop and the CPU Riccati "
+                "backend only"
+            )
+        if admm_backend == AdmmBackend.FUSED_RICCATI_CPU:
+            if not self._fixed_iterations:
+                raise ValueError(
+                    "the CPU Riccati ADMM runs a fixed number of iterations: set "
+                    "admm fixed_iterations=True"
+                )
+            if self._constraint_handling != ConstraintHandling.PROJECTION:
+                raise ValueError("the CPU Riccati ADMM supports projection handling only")
+            if self._use_slack_variables:
+                raise ValueError("the CPU Riccati ADMM does not support slack variables")
+            # Registers the FFI targets before anything is traced or loaded.
+            import turbompc.solvers.admm.admm_riccati_cpu_backend  # noqa: F401
 
     @property
     def schur_solver(self) -> Optional[SchurSystemSolver]:
@@ -987,6 +1021,14 @@ class ADMMSolver:
         return self._constraint_handling
 
     @property
+    def fixed_iterations(self) -> bool:
+        return self._fixed_iterations
+
+    @property
+    def num_threads(self) -> int:
+        return self._num_threads
+
+    @property
     def log_barrier_kappa(self) -> float:
         return self._log_barrier_kappa
 
@@ -1024,9 +1066,41 @@ class ADMMSolver:
         rho_bar: float = 1.0,
         alpha: float = 1.0,
     ) -> ADMMResult:
+        if self._admm_backend == AdmmBackend.FUSED_RICCATI_CPU:
+            return self._solve_fused_riccati_cpu(qp_data, admm_state0, rho_bar, alpha)
         if self._admm_backend != AdmmBackend.JAX_LOOP:
             return self._solve_fused(qp_data, admm_state0, rho_bar, alpha)
         return self._solve_jax_loop(qp_data, admm_state0, rho_bar, alpha)
+
+    def _solve_fused_riccati_cpu(
+        self,
+        qp_data: QPData,
+        admm_state0: Optional[ADMMState] = None,
+        rho_bar: float = 1.0,
+        alpha: float = 1.0,
+    ) -> ADMMResult:
+        """Fixed-iteration ADMM in one native CPU call (Riccati-type factor once)."""
+        from turbompc.solvers.admm.admm_riccati_cpu_backend import (
+            admm_riccati_cpu_solve,
+        )
+
+        state0 = (
+            self.initial_state(qp_data, rho_bar=rho_bar)
+            if admm_state0 is None
+            else admm_state0
+        )
+        result = admm_riccati_cpu_solve(
+            qp_data,
+            state0,
+            max_iter=self._max_iter,
+            sigma=self._sigma,
+            rho_f_factor=self._rho_f_factor,
+            alpha=alpha,
+            eps_abs=self._eps_abs,
+            eps_rel=self._eps_rel,
+            num_threads=self._num_threads,
+        )
+        return ADMMResult(state=result.state, stats=result.stats, iterations=None)
 
     def _solve_fused(
         self,
@@ -1166,6 +1240,7 @@ class ADMMSolver:
             eps_prim_inf=self._eps_prim_inf,
             eps_dual_inf=self._eps_dual_inf,
             check_infeasibility_every=self._check_infeasibility_every,
+            fixed_iterations=self._fixed_iterations,
         )
 
         if admm_state0 is None:
@@ -1192,7 +1267,7 @@ class ADMMSolver:
         dual_limits = jnp.zeros((params.max_iter,), dtype=dtype)
         pcg_iters = jnp.zeros((params.max_iter,), dtype=jnp.int32)
         rhos = jnp.zeros((params.max_iter,), dtype=dtype)
-        detect_infeasibility = self._detects_infeasibility
+        detect_infeasibility = self._detects_infeasibility and not params.fixed_iterations
 
         def cond_fun(carry):
             it, _, _, _, _, _, _, _, _, _, _, status, _ = carry
@@ -1318,9 +1393,7 @@ class ADMMSolver:
                 xi_g=xi_g,
                 rho_bar=rho_new,
             )
-            should_check_termination = ((it % params.check_termination_every) == 0) | (
-                (it + 1) == params.max_iter
-            )
+            should_check_termination = _checks_termination(params, it)
             if detect_infeasibility:
                 should_check_infeasibility = (
                     (it % params.check_infeasibility_every) == 0
@@ -1454,12 +1527,15 @@ class ADMMSolver:
             params.eps_rel,
         )
         indices = jnp.arange(params.max_iter)
-        residuals_valid = ((indices % params.check_termination_every) == 0) & (
-            indices < it
-        )
-        residuals_valid = residuals_valid | (
-            (indices == (it - 1)) & (it == params.max_iter)
-        )
+        if params.fixed_iterations:
+            residuals_valid = indices == (it - 1)
+        else:
+            residuals_valid = ((indices % params.check_termination_every) == 0) & (
+                indices < it
+            )
+            residuals_valid = residuals_valid | (
+                (indices == (it - 1)) & (it == params.max_iter)
+            )
         iterations = ADMMIterationStats(
             residuals_valid=residuals_valid,
             primal_residuals=res_primals,

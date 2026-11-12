@@ -200,10 +200,56 @@ if(TURBOMPC_EIGEN_ENABLED)
   )
 endif()
 
+# ── CPU fused ADMM, Riccati-type factorization (XLA FFI) ──────────
+# Needs only the Eigen headers (no pybind11): the library is loaded with ctypes
+# from turbompc/solvers/_ffi, like the CUDA FFI libraries.
+set(TURBOMPC_RICCATI_CPU "AUTO" CACHE STRING "CPU Riccati ADMM FFI library: AUTO, ON, or OFF")
+turbompc_resolve_tristate(TURBOMPC_RICCATI_CPU)
+set(TURBOMPC_RICCATI_CPU_ENABLED OFF)
+if(NOT TURBOMPC_RICCATI_CPU STREQUAL "OFF")
+  set(_riccati_eigen_dir "${EIGEN_INCLUDE_DIR}")
+  if(NOT _riccati_eigen_dir AND DEFINED ENV{EIGEN_INCLUDE_DIR})
+    set(_riccati_eigen_dir "$ENV{EIGEN_INCLUDE_DIR}")
+  endif()
+  if(NOT _riccati_eigen_dir)
+    find_package(Eigen3 3.3 QUIET NO_MODULE)
+    if(Eigen3_FOUND)
+      get_target_property(_riccati_eigen_dir Eigen3::Eigen INTERFACE_INCLUDE_DIRECTORIES)
+    else()
+      set(_riccati_eigen_dir "/usr/include/eigen3")
+    endif()
+  endif()
+  if(EXISTS "${_riccati_eigen_dir}/Eigen/Core")
+    set(TURBOMPC_RICCATI_CPU_ENABLED ON)
+  elseif(TURBOMPC_RICCATI_CPU STREQUAL "ON")
+    message(FATAL_ERROR
+      "TURBOMPC_RICCATI_CPU=ON but Eigen headers were not found at ${_riccati_eigen_dir}.\n"
+      "  Point at them:  -DEIGEN_INCLUDE_DIR=<path>, or -DTURBOMPC_RICCATI_CPU=OFF")
+  else()
+    message(STATUS "CPU Riccati ADMM: Eigen headers not found - skipping (admm_fused_riccati_cpu unavailable)")
+  endif()
+endif()
+
+if(TURBOMPC_RICCATI_CPU_ENABLED)
+  find_package(Threads REQUIRED)
+  add_library(admm_riccati_cpu SHARED turbompc/solvers/admm/admm_riccati_cpu.cpp)
+  target_include_directories(admm_riccati_cpu SYSTEM PRIVATE
+    ${JAXLIB_INCLUDE_DIR}
+    ${_riccati_eigen_dir}
+  )
+  target_link_libraries(admm_riccati_cpu PRIVATE Threads::Threads)
+  # libadmm_riccati_cpu.so on every platform: ffi_loader looks it up by that name.
+  set_target_properties(admm_riccati_cpu PROPERTIES PREFIX "lib" SUFFIX ".so")
+  install(TARGETS admm_riccati_cpu
+    LIBRARY DESTINATION turbompc/solvers/_ffi
+  )
+endif()
+
 # ── Configuration summary ─────────────────────────────────────────
 message(STATUS "")
 message(STATUS "turbompc configuration:")
 message(STATUS "  CUDA FFI libraries : ${TURBOMPC_CUDA_ENABLED} (TURBOMPC_CUDA=${TURBOMPC_CUDA})")
 message(STATUS "  Eigen extension    : ${TURBOMPC_EIGEN_ENABLED} (TURBOMPC_EIGEN=${TURBOMPC_EIGEN})")
+message(STATUS "  CPU Riccati ADMM   : ${TURBOMPC_RICCATI_CPU_ENABLED} (TURBOMPC_RICCATI_CPU=${TURBOMPC_RICCATI_CPU})")
 message(STATUS "Verify the installed result with: turbompc-check")
 message(STATUS "")

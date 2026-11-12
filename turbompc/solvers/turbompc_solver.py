@@ -71,6 +71,9 @@ class ForwardBackend(enum.IntEnum):
     ADMM_FUSED_PCG = 4
     ADMM_FUSED_CUDSS = 5
     ADMM_JAX_LOOP_EIGEN = 6
+    # CPU only, opt-in: fixed-iteration ADMM in one native call with a Riccati-type
+    # factorization (admm.fixed_iterations must be true).
+    ADMM_FUSED_RICCATI_CPU = 7
 
 
 class BackwardBackend(enum.IntEnum):
@@ -123,6 +126,10 @@ _FORWARD_BACKEND_COMPONENTS: dict[
         AdmmBackend.FUSED_CUDSS,
         SchurSolverBackend.IGNORED,
     ),
+    ForwardBackend.ADMM_FUSED_RICCATI_CPU: (
+        AdmmBackend.FUSED_RICCATI_CPU,
+        SchurSolverBackend.IGNORED,
+    ),
 }
 
 
@@ -162,6 +169,7 @@ _NAME_TO_FORWARD_BACKEND: dict[str, ForwardBackend] = {
     "admm_jax_loop_eigen": ForwardBackend.ADMM_JAX_LOOP_EIGEN,
     "admm_fused_pcg": ForwardBackend.ADMM_FUSED_PCG,
     "admm_fused_cudss": ForwardBackend.ADMM_FUSED_CUDSS,
+    "admm_fused_riccati_cpu": ForwardBackend.ADMM_FUSED_RICCATI_CPU,
 }
 
 
@@ -518,6 +526,8 @@ class TurboMPCSolver:
             eps_dual_inf=admm_params.get("eps_dual_inf", 1.0e-4),
             constraint_handling=self._constraint_handling,
             log_barrier_kappa=self._log_barrier_kappa,
+            fixed_iterations=admm_params.get("fixed_iterations", False),
+            num_threads=admm_params.get("num_threads", 1),
         )
         self._admm_solver_bwd = (
             ADMMSolver(
